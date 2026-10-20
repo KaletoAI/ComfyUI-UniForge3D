@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.runtime/
+.verification/
+*.glb
+*.safetensors
+*.pt

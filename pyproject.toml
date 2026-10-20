@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-uniforge3d"
+version = "1.0.0"
+description = "Unofficial isolated-worker ComfyUI bridge for UniForge3D multi-view textured meshes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/KaletoAI/ComfyUI-UniForge3D"
+Documentation = "https://github.com/KaletoAI/ComfyUI-UniForge3D#readme"
+Issues = "https://github.com/KaletoAI/ComfyUI-UniForge3D/issues"
+
+[tool.comfy]
+PublisherId = "kaleto"
+DisplayName = "UniForge3D Multi-view (Isolated Worker)"
