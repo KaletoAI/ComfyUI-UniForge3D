@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 (2026-11-07)
+
+- Load each upstream stage only while it runs (`lazy_stages.py`). Upstream constructs every stage model (about 30 GB FP32) in CPU RAM up front; `low_vram` only moves the active stage to the GPU. Weights, precision and stage code stay upstream; models are built on first use and dropped after their stage. The shared VGGT conditioner stays loaded across Shape512, Shape1024 and texture.
+- Model construction runs inside `torch.random.fork_rng`, so the seeded sampling stream is unchanged by mid-run loading.
+
+Verification: twelve CPU regression tests (incl. four new stage-loading tests; the RNG test fails without `fork_rng`). Real four-view default job on RTX 3090 in a 32 GiB container: 262.9 s, peak anonymous memory 15.6 GiB (previously OOM-killed at 32 GiB), no swap; GLB with 94,965 triangles, 2048² base color and metallic-roughness texture.
+
 ## 1.0.0 — 2026-10-20
 
 - Extract the existing ComfyUI UniForge3D process bridge into an independent, explicitly unofficial project.

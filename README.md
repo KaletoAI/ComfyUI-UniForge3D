@@ -2,7 +2,7 @@
 
 **Unofficial ComfyUI custom node for [UniForge3D](https://github.com/xibushu/UniForge3D): consistent views of one object → textured PBR GLB.** This repository provides the ComfyUI/process bridge, not a new model or an upstream fork.
 
-The complete upstream structure → Shape512 → Shape1024 → PBR pipeline runs in a separate Python process with low-VRAM CPU offloading. ComfyUI's loaded models are unloaded before generation. Cancellation terminates and reaps the worker. Each job has its own output directory and temporary images.
+The complete upstream structure → Shape512 → Shape1024 → PBR pipeline runs in a separate Python process with low-VRAM CPU offloading. Stage models are loaded only while their stage runs, so peak CPU RAM is one stage (measured 15.6 GiB anonymous on RTX 3090), not the whole pipeline. ComfyUI's loaded models are unloaded before generation. Cancellation terminates and reaps the worker. Each job has its own output directory and temporary images.
 
 ## Requirements and support boundary
 
