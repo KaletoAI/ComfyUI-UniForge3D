@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-uniforge3d"
-version = "1.0.1"
+version = "1.0.2"
 description = "Unofficial isolated-worker ComfyUI bridge for UniForge3D multi-view textured meshes."
 readme = "README.md"
 requires-python = ">=3.10"

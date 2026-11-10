@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.2 (2026-11-10)
+
+Bound peak VRAM of the upstream stages (`lean_vram.py`) so very dense geometry (hair, fur, thin strands) fits a 24 GB RTX 3090. Weights, precision, resolutions, sampler settings and numeric operations stay upstream; only when tensors and models occupy the GPU changes.
+
+- Texture stage: sample with the texture denoiser and VGGT conditioner, move both off the GPU, then decode. Upstream kept about 9 GB of idle sampler weights resident during shape/texture decoding and hole filling.
+- Narrow-band remeshing (`cumesh.remeshing.remesh_narrow_band_dc`, used by the Shape-512 postprocess and the PBR bake): same algorithm, dead temporaries freed, edge-neighbour table gathered only for intersected edges. Bit-identical output to CuMesh 12289e1 on a 19 M-face remesh, PyTorch peak 6.35 → 1.84 GiB.
+- Shape-512 postprocess: raw decoded mesh, pre-fill CuMesh buffers and BVH released as soon as they are no longer needed; the PyTorch cache is emptied before CuMesh steps, which allocate with raw `cudaMalloc`.
+- Sparse VAE decoders: `LayerNorm32` runs in row blocks on large 2-D inputs and `F.silu` after a norm runs in place. Both bit-identical to upstream on an RTX 3090 (fp16/fp32, with/without affine).
+
+Verification: 17 CPU regression tests (five new). RTX 3090, inputs that previously failed with CUDA OOM at Shape-512 (`Kai-hair`) and at shape decoding / hole filling (`Kira-hair`), two views each, dielectric + opaque, defaults otherwise:
+- Kira-hair: 375 s, total GPU peak 12.9 GiB, 95,426 triangles, GLB 11.7 MB.
+- Kai-hair: 751 s, total GPU peak 23.2 GiB (final shape/texture decode and PBR bake, whose remesh reaches 64 M faces), 95,986 triangles, GLB 7.2 MB. Fits, with little headroom.
+- Official four example views, seed 42: total GPU peak 13.8–14.3 GiB → 10.5 GiB, runtime 250 → 259 s.
+
+UniForge3D is not run-to-run reproducible on CUDA: two runs of the previous worker with the same seed produced different decoded meshes (6,379,436 vs 6,324,970 faces). A byte comparison of the full pipeline is therefore impossible; the deterministic pieces above were compared exactly.
+
 ## 1.0.1 (2026-11-07)
 
 - Load each upstream stage only while it runs (`lazy_stages.py`). Upstream constructs every stage model (about 30 GB FP32) in CPU RAM up front; `low_vram` only moves the active stage to the GPU. Weights, precision and stage code stay upstream; models are built on first use and dropped after their stage. The shared VGGT conditioner stays loaded across Shape512, Shape1024 and texture.

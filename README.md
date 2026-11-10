@@ -2,7 +2,7 @@
 
 **Unofficial ComfyUI custom node for [UniForge3D](https://github.com/xibushu/UniForge3D): consistent views of one object → textured PBR GLB.** This repository provides the ComfyUI/process bridge, not a new model or an upstream fork.
 
-The complete upstream structure → Shape512 → Shape1024 → PBR pipeline runs in a separate Python process with low-VRAM CPU offloading. Stage models are loaded only while their stage runs, so peak CPU RAM is one stage (measured 15.6 GiB anonymous on RTX 3090), not the whole pipeline. ComfyUI's loaded models are unloaded before generation. Cancellation terminates and reaps the worker. Each job has its own output directory and temporary images.
+The complete upstream structure → Shape512 → Shape1024 → PBR pipeline runs in a separate Python process with low-VRAM CPU offloading. Stage models are loaded only while their stage runs, so peak CPU RAM is one stage (measured 15.6 GiB anonymous on RTX 3090), not the whole pipeline. GPU residency and decoder/remesh temporaries are bounded as well (`lean_vram.py`, numerically unchanged), so very dense inputs such as hair fit 24 GB. ComfyUI's loaded models are unloaded before generation. Cancellation terminates and reaps the worker. Each job has its own output directory and temporary images.
 
 ## Requirements and support boundary
 
@@ -128,7 +128,7 @@ CPU-only checks (Pillow with WebP support is needed for the regression fixture):
 ```bash
 python -m pip install Pillow
 python -m unittest discover -s tests -v
-python -m py_compile __init__.py configuration.py worker.py glb_material.py
+python -m py_compile __init__.py configuration.py worker.py glb_material.py lazy_stages.py lean_vram.py
 bash -n install-runtime.sh
 python worker.py --help
 ```

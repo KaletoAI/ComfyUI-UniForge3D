@@ -34,8 +34,12 @@ def main():
     os.environ.setdefault("ATTN_BACKEND", "flash_attn")
     os.environ.setdefault("SPARSE_ATTN_BACKEND", "flash_attn")
     sys.path.insert(0, str(args.source))
-    from uniforge3d.pipelines import uniforge3d_image_to_3d
+    from uniforge3d.pipelines import texture, uniforge3d_image_to_3d
     from lazy_stages import lazy_pipeline_class
+    from lean_vram import install_lean_cumesh, install_lean_decoder_ops, lean_vram_pipeline_class
+
+    install_lean_cumesh()
+    install_lean_decoder_ops()
 
     root = args.models / "uniforge3d"
     config = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
@@ -63,7 +67,9 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     local_config = args.output.parent / "pipeline-local.json"
     local_config.write_text(json.dumps(config), encoding="utf-8")
-    pipeline = lazy_pipeline_class(uniforge3d_image_to_3d).from_config(
+    pipeline_class = lean_vram_pipeline_class(
+        lazy_pipeline_class(uniforge3d_image_to_3d), uniforge3d_image_to_3d, texture)
+    pipeline = pipeline_class.from_config(
         local_config, weights_root=root, low_vram=True,
         cache_dir=str(args.cache / "hub"), local_files_only=True,
     )
