@@ -16,6 +16,9 @@ operations; only when tensors and models live on the GPU:
 - ``remesh_narrow_band_dc``: same algorithm and values, but dead temporaries are
   freed and the per-voxel edge-neighbour table is built only for intersected
   edges instead of for every voxel (144 bytes per voxel).
+- PBR bake (``remesh_and_bake_texture``/``to_glb``): voxel attributes and the
+  original surface wait on the CPU while the bake remesh and its simplification
+  run, and the PyTorch cache is emptied before CuMesh simplifies 60+ M faces.
 """
 import gc
 
@@ -307,6 +310,242 @@ def lean_decode_shape_and_texture(shape_decoder, texture_decoder, shape_vae_late
     return mesh, voxel
 
 
+def lean_flexible_dual_grid_to_mesh(original, voxel_module):
+    """``o_voxel.convert.flexible_dual_grid_to_mesh`` (inference path) with bounded temporaries.
+
+    Used by the Shape-512/1024 decoders. Upstream builds the full per-voxel
+    edge-neighbour table (144 bytes per voxel, 3.6-5.8 GB on hair at 1024),
+    computes a training-only vertex array that is immediately overwritten and
+    keeps the hashmap and lookup keys alive until it returns. Same operations
+    and order here; the neighbours are gathered only for intersected edges
+    (``gather_edge_neighbours``, same values and order) and dead tensors are
+    released as soon as the next step owns its input. Other call forms
+    (training, explicit voxel size, no split weights) go to upstream.
+    """
+    import numpy as np
+
+    offsets = torch.tensor([
+        [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+        [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+    ], dtype=torch.int).unsqueeze(0)
+    quad_split_1 = torch.tensor([0, 1, 2, 0, 2, 3], dtype=torch.long)
+    quad_split_2 = torch.tensor([0, 1, 3, 3, 1, 2], dtype=torch.long)
+
+    def flexible_dual_grid_to_mesh(coords, dual_vertices, intersected_flag, split_weight,
+                                   aabb, voxel_size=None, grid_size=None, train=False):
+        if (train or split_weight is None or voxel_size is not None
+                or not isinstance(grid_size, int) or not isinstance(aabb, (list, tuple))):
+            return original(coords, dual_vertices, intersected_flag, split_weight,
+                            aabb, voxel_size=voxel_size, grid_size=grid_size, train=train)
+        device = coords.device
+        aabb = torch.tensor(np.array(aabb), dtype=torch.float32, device=device)
+        grid_size = torch.tensor(np.array([grid_size, grid_size, grid_size]), dtype=torch.int32, device=device)
+        voxel_size = (aabb[1] - aabb[0]) / grid_size
+
+        N = dual_vertices.shape[0]
+        hashmap = voxel_module._init_hashmap(grid_size, 2 * N, device=device)
+        voxel_module._C.hashmap_insert_3d_idx_as_val_cuda(
+            *hashmap, torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1), *grid_size.tolist())
+
+        connected_voxel, _ = gather_edge_neighbours(coords, intersected_flag, offsets.to(device))
+        M = connected_voxel.shape[0]
+        connected_voxel_hash_key = torch.cat([
+            torch.zeros((M * 4, 1), dtype=torch.int, device=device),
+            connected_voxel.reshape(-1, 3),
+        ], dim=1)
+        del connected_voxel
+        connected_voxel_indices = voxel_module._C.hashmap_lookup_3d_cuda(
+            *hashmap, connected_voxel_hash_key, *grid_size.tolist()).reshape(M, 4).int()
+        del connected_voxel_hash_key, hashmap
+        connected_voxel_valid = (connected_voxel_indices != 0xffffffff).all(dim=1)
+        quad_indices = connected_voxel_indices[connected_voxel_valid].int()
+        del connected_voxel_indices, connected_voxel_valid
+
+        mesh_vertices = (coords.float() + dual_vertices) * voxel_size + aabb[0].reshape(1, 3)
+        split_weight_ws = split_weight[quad_indices]
+        split_weight_ws_02 = split_weight_ws[:, 0] * split_weight_ws[:, 2]
+        split_weight_ws_13 = split_weight_ws[:, 1] * split_weight_ws[:, 3]
+        del split_weight_ws
+        choose_02 = split_weight_ws_02 > split_weight_ws_13
+        del split_weight_ws_02, split_weight_ws_13
+        mesh_triangles = torch.where(
+            choose_02,
+            quad_indices[:, quad_split_1.to(device)],
+            quad_indices[:, quad_split_2.to(device)],
+        ).reshape(-1, 3)
+        return mesh_vertices, mesh_triangles
+
+    return flexible_dual_grid_to_mesh
+
+
+def lean_remesh_and_bake_texture(texture_config, mesh_config, inputs):
+    """Upstream ``remesh_and_bake_texture`` + ``to_glb(remesh=True)`` with bounded residency.
+
+    ``inputs`` holds ``mesh`` (decoded ``Mesh``) and ``pbr_voxel``; both are
+    popped so that this frame owns the only references. Same calls, arguments
+    and order as UniForge 8b60947 ``texture_baking.to_glb``; changes:
+
+    - PBR voxel attributes and the original surface wait on the CPU while
+      remeshing and simplification run (exact round trip); ``cuBVH`` keeps its
+      own copy of the triangles.
+    - The narrow-band remesh result goes into a fresh ``CuMesh`` and the
+      PyTorch cache is emptied before simplifying 60+ M faces, because CuMesh
+      allocates with raw ``cudaMalloc`` and cannot use cached blocks.
+    - Pre-fill buffers, the remesh tensors and the CuMesh object are released
+      once the next step owns a copy.
+    """
+    import cumesh
+    import cumesh.remeshing
+    import cv2
+    import numpy as np
+    import nvdiffrast.torch as dr
+    import trimesh
+    import trimesh.visual
+    from PIL import Image
+    from flex_gemm.ops.grid_sample import grid_sample_3d
+
+    mesh = inputs.pop("mesh")
+    pbr_voxel = inputs.pop("pbr_voxel")
+    mesh.simplify(int(mesh_config["pre_simplify_target"]))
+    vertices, faces = mesh.vertices.cuda(), mesh.faces.cuda()
+    del mesh
+    attr_volume = pbr_voxel.feats.cpu()
+    coords = pbr_voxel.coords[:, 1:].cpu()
+    del pbr_voxel
+    release_cuda()
+
+    attr_layout = {"base_color": slice(0, 3), "metallic": slice(3, 4), "roughness": slice(4, 5), "alpha": slice(5, 6)}
+    texture_size = int(texture_config["texture_size"])
+    decimation_target = int(texture_config.get("decimation_target", mesh_config["decimation_target"]))
+    remesh_band = float(mesh_config["remesh_band"])
+    remesh_project = float(mesh_config["remesh_project"])
+    grid = int(mesh_config["grid_size"])
+    aabb = torch.tensor(np.array([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]]), dtype=torch.float32, device="cuda")
+    grid_size = torch.tensor(np.array([grid, grid, grid]), dtype=torch.int32, device="cuda")
+    voxel_size = (aabb[1] - aabb[0]) / grid_size
+
+    print(f"Original mesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
+    work = cumesh.CuMesh()
+    work.init(vertices, faces)
+    work.fill_holes(max_hole_perimeter=3e-2)
+    print(f"After filling holes: {work.num_vertices} vertices, {work.num_faces} faces")
+    vertices, faces = work.read()
+    del work
+    print("Building BVH for current mesh...", end="", flush=True)
+    bvh = cumesh.cuBVH(vertices, faces)
+    print("Done")
+    print("Cleaning mesh...")
+    center = aabb.mean(dim=0)
+    scale = (aabb[1] - aabb[0]).max().item()
+    resolution = grid_size.max().item()
+    remeshed = cumesh.remeshing.remesh_narrow_band_dc(
+        vertices, faces,
+        center=center,
+        scale=(resolution + 3 * remesh_band) / resolution * scale,
+        resolution=resolution,
+        band=remesh_band,
+        project_back=remesh_project,
+        verbose=True,
+        bvh=bvh,
+    )
+    vertices, faces = vertices.cpu(), faces.cpu()
+    work = cumesh.CuMesh()
+    work.init(*remeshed)
+    del remeshed
+    release_cuda()
+    print(f"After remeshing: {work.num_vertices} vertices, {work.num_faces} faces")
+    work.simplify(decimation_target, verbose=True)
+    print(f"After simplifying: {work.num_vertices} vertices, {work.num_faces} faces")
+    print("Done")
+
+    print("Parameterizing new mesh...")
+    out_vertices, out_faces, out_uvs, out_vmaps = work.uv_unwrap(
+        compute_charts_kwargs={
+            "threshold_cone_half_angle_rad": np.radians(90.0),
+            "refine_iterations": 0,
+            "global_iterations": 1,
+            "smooth_strength": 1,
+        },
+        return_vmaps=True,
+        verbose=True,
+    )
+    out_vertices = out_vertices.cuda()
+    out_faces = out_faces.cuda()
+    out_uvs = out_uvs.cuda()
+    out_vmaps = out_vmaps.cuda()
+    work.compute_vertex_normals()
+    out_normals = work.read_vertex_normals()[out_vmaps]
+    del work
+    print("Done")
+
+    print("Sampling attributes...", end="", flush=True)
+    ctx = dr.RasterizeCudaContext()
+    uvs_rast = torch.cat([out_uvs * 2 - 1, torch.zeros_like(out_uvs[:, :1]), torch.ones_like(out_uvs[:, :1])], dim=-1).unsqueeze(0)
+    rast = torch.zeros((1, texture_size, texture_size, 4), device="cuda", dtype=torch.float32)
+    for i in range(0, out_faces.shape[0], 100000):
+        rast_chunk, _ = dr.rasterize(ctx, uvs_rast, out_faces[i:i + 100000], resolution=[texture_size, texture_size])
+        mask_chunk = rast_chunk[..., 3:4] > 0
+        rast_chunk[..., 3:4] += i
+        rast = torch.where(mask_chunk, rast_chunk, rast)
+    mask = rast[0, ..., 3] > 0
+    pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
+    valid_pos = pos[mask]
+    _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
+    del bvh
+    vertices, faces = vertices.cuda(), faces.cuda()
+    orig_tri_verts = vertices[faces[face_id.long()]]
+    valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+    del vertices, faces, orig_tri_verts
+    attr_volume, coords = attr_volume.cuda(), coords.cuda()
+    attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device="cuda")
+    attrs[mask] = grid_sample_3d(
+        attr_volume,
+        torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
+        shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
+        grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
+        mode="trilinear",
+    )
+    print("Done")
+
+    print("Finalizing mesh...", end="", flush=True)
+    mask = mask.cpu().numpy()
+    base_color = np.clip(attrs[..., attr_layout["base_color"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    metallic = np.clip(attrs[..., attr_layout["metallic"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    roughness = np.clip(attrs[..., attr_layout["roughness"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    alpha = np.clip(attrs[..., attr_layout["alpha"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    mask_inv = (~mask).astype(np.uint8)
+    base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
+    metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+    roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+    alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+    material = trimesh.visual.material.PBRMaterial(
+        baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], axis=-1)),
+        baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+        metallicRoughnessTexture=Image.fromarray(np.concatenate([np.zeros_like(metallic), roughness, metallic], axis=-1)),
+        metallicFactor=1.0,
+        roughnessFactor=1.0,
+        alphaMode="OPAQUE",
+        doubleSided=False,
+    )
+    vertices_np = out_vertices.cpu().numpy()
+    faces_np = out_faces.cpu().numpy()
+    uvs_np = out_uvs.cpu().numpy()
+    normals_np = out_normals.cpu().numpy()
+    vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2], -vertices_np[:, 1]
+    normals_np[:, 1], normals_np[:, 2] = normals_np[:, 2], -normals_np[:, 1]
+    uvs_np[:, 1] = 1 - uvs_np[:, 1]
+    textured_mesh = trimesh.Trimesh(
+        vertices=vertices_np,
+        faces=faces_np,
+        vertex_normals=normals_np,
+        process=False,
+        visual=trimesh.visual.TextureVisuals(uv=uvs_np, material=material),
+    )
+    print("Done")
+    return textured_mesh
+
+
 LAYER_NORM_CHUNK_ROWS = 1 << 18
 
 
@@ -349,7 +588,7 @@ def chunked_layer_norm32(original_forward, chunk_rows=LAYER_NORM_CHUNK_ROWS):
 
 
 def install_lean_decoder_ops():
-    """Patch the sparse VAE decoders' LayerNorm32 and SiLU (values unchanged)."""
+    """Patch the sparse VAE decoders' LayerNorm32, SiLU and mesh extraction (values unchanged)."""
     from uniforge3d.models.vaes import sparse_unet
     from uniforge3d.modules import norm
 
@@ -358,6 +597,14 @@ def install_lean_decoder_ops():
         forward._lean_vram = True
         norm.LayerNorm32.forward = forward
     sparse_unet.F = _InplaceSiluFunctional()
+
+    from o_voxel.convert import flexible_dual_grid as voxel_module
+    from uniforge3d.models.vaes import flexi_dual_grid
+
+    if not getattr(flexi_dual_grid.flexible_dual_grid_to_mesh, "_lean_vram", False):
+        extract = lean_flexible_dual_grid_to_mesh(flexi_dual_grid.flexible_dual_grid_to_mesh, voxel_module)
+        extract._lean_vram = True
+        flexi_dual_grid.flexible_dual_grid_to_mesh = extract
 
 
 def install_lean_cumesh():
@@ -411,11 +658,8 @@ def lean_vram_pipeline_class(base, pipeline_module, texture_module):
                 reference_mesh, pbr_voxel = lean_decode_shape_and_texture(
                     self.shape1024_decoder, self.texture_decoder, shape_vae_latent, texture_vae_latent)
                 del shape_vae_latent, texture_vae_latent
-            return texture_module.remesh_and_bake_texture(
-                config,
-                self.config["mesh_postprocess"],
-                reference_mesh,
-                pbr_voxel,
-            )
+            inputs = {"mesh": reference_mesh, "pbr_voxel": pbr_voxel}
+            del reference_mesh, pbr_voxel
+            return lean_remesh_and_bake_texture(config, self.config["mesh_postprocess"], inputs)
 
     return LeanVramPipeline

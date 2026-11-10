@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.3 (2026-11-10)
+
+Per-step VRAM measurement on the hair input showed that the run peak is in the Shape-1024/texture decode, not in the PBR bake; 1.0.2 had one Kai-hair run (of four) still fail with CUDA OOM in the mesh extraction.
+
+- Mesh extraction (`o_voxel.convert.flexible_dual_grid_to_mesh`, used by the Shape-512/1024 decoders): gathers edge neighbours only for intersected edges instead of building the full 144-byte-per-voxel table, skips a training-only vertex array and frees hashmap/lookup temporaries early. Bit-identical to o_voxel 0.0.1 on an RTX 3090 (25 M voxels, 96 M faces; upstream itself reproducible); extraction peak 15.4 → 6.7 GiB. Shape-1024 decoder PyTorch peak on Kai-hair 21.5 → 14.5 GiB.
+- PBR bake (`remesh_and_bake_texture`/`to_glb`): voxel attributes and original surface wait on the CPU during remesh and simplification, PyTorch cache emptied before CuMesh simplifies 60+ M faces. Isolated bake peak on a Kai-hair dump 12.7 → 8.3 GiB. The upstream bake is not run-to-run reproducible (CuMesh GPU simplification: two runs gave 95,793 and 96,258 faces); the lean bake (96,346) lies within that spread.
+
+Verification: 19 CPU regression tests (two new for the extraction). Kai-hair, seed 42, full run: success, total GPU peak 22.8 GiB. The texture decoder (PyTorch reserved up to 20.7 GiB) is now the highest stage; hair inputs still run close to 24 GB.
+
 ## 1.0.2 (2026-11-10)
 
 Bound peak VRAM of the upstream stages (`lean_vram.py`) so very dense geometry (hair, fur, thin strands) fits a 24 GB RTX 3090. Weights, precision, resolutions, sampler settings and numeric operations stay upstream; only when tensors and models occupy the GPU changes.
